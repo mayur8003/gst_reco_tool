@@ -1,4 +1,20 @@
 import streamlit as st
+
+# ------------------ PASSWORD PROTECTION ------------------
+if 'authenticated' not in st.session_state:
+    st.session_state['authenticated'] = False
+
+if not st.session_state['authenticated']:
+    password = st.text_input("Enter password to access the app:", type="password")
+    if password == "mayur123":  # <-- Replace with your password
+        st.session_state['authenticated'] = True
+        st.experimental_rerun() if hasattr(st, 'experimental_rerun') else None
+    else:
+        if password:  # Only show warning if user typed something
+            st.warning("Incorrect password!")
+        st.stop()  # Stops app from running until correct password
+
+import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO
