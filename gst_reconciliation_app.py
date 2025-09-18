@@ -18,13 +18,12 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO
+import altair as alt
 
 st.set_page_config(page_title="GST Reconciliation Tool", layout="wide")
 st.title("📊 GST Reconciliation Tool (Invoice-level)")
 
-# ------------------------
-# Download Blank Template
-# ------------------------
+# ------------------------ Download Blank Template ------------------------
 template_columns = [
     "GSTIN/UIN OF RECIPIENT",
     "RECEIVER NAME",
@@ -53,9 +52,7 @@ st.download_button(
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-# ------------------------
-# Helper Functions
-# ------------------------
+# ------------------------ Helper Functions ------------------------
 def read_file(file):
     if file.name.endswith("csv"):
         return pd.read_csv(file, dtype=str)
@@ -68,29 +65,29 @@ def preprocess(df):
         df_clean[col] = df_clean[col].str.strip()
         df_clean[col] = df_clean[col].str.upper()
         df_clean[col] = df_clean[col].str.replace(r"\s+", " ", regex=True)
-    if "INVOICE DATE" in df_clean.columns:
-        def format_date_safe(val):
-            if pd.isna(val) or val == "":
-                return ""
-            try:
-                dt = pd.to_datetime(val, errors="coerce", dayfirst=True, infer_datetime_format=True)
-                if pd.isna(dt):
-                    return str(val)
-                return dt.strftime("%d-%m-%Y")
-            except:
-                return str(val)
-        df_clean["INVOICE DATE"] = df_clean["INVOICE DATE"].apply(format_date_safe)
-    return df_clean
 
-def aggregate_books(df, key_cols, amount_cols):
-    agg_dict = {col: "sum" for col in amount_cols if col in df.columns}
-    df_agg = df.groupby(key_cols, as_index=False).agg(agg_dict)
-    return df_agg
+    if "INVOICE DATE" in df_clean.columns:
+        def normalize_date(val):
+            val = str(val).strip()
+            if val == "" or pd.isna(val):
+                return ""
+            val = val.split(" ")[0]
+            for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%d-%b-%Y", "%d-%b-%y", "%Y-%m-%d", "%Y/%m/%d"):
+                try:
+                    dt = pd.to_datetime(val, format=fmt, errors="raise", dayfirst=True)
+                    return dt.strftime("%d-%m-%Y")
+                except:
+                    continue
+            return val
+        df_clean["INVOICE DATE"] = df_clean["INVOICE DATE"].apply(normalize_date)
+
+    return df_clean
 
 def clean_state(val):
     parts = str(val).upper().split("-")
     return parts[-1].strip() if len(parts) > 1 else str(val).upper().strip()
 
+# ------------------------ Reconciliation Function ------------------------
 def reconcile_rows(books_df, gst_df, key_cols, amount_cols, numeric_tolerance=1.0):
     books_df = preprocess(books_df)
     gst_df = preprocess(gst_df)
@@ -101,91 +98,76 @@ def reconcile_rows(books_df, gst_df, key_cols, amount_cols, numeric_tolerance=1.
         if col in gst_df.columns:
             gst_df[col] = pd.to_numeric(gst_df[col], errors="coerce").fillna(0)
 
-    books_agg = aggregate_books(books_df, key_cols, amount_cols)
+    merged = pd.merge(
+        books_df, gst_df,
+        on="INVOICE NO", how="outer",
+        suffixes=("_BOOKS", "_GST"), indicator=True
+    )
 
     full_result = []
     annexure = []
-    gst_matched_indices = set()
 
-    for idx_b, b_row in books_df.iterrows():
-        if "INVOICE NO" not in gst_df.columns:
-            st.error("Column 'INVOICE NO' not found in GST data")
-            return pd.DataFrame(), pd.DataFrame()
+    numeric_cols = amount_cols
+    all_fields = [c for c in template_columns if c in books_df.columns and c in gst_df.columns]
+    strict_cols = [c for c in all_fields if c not in numeric_cols + ["INVOICE NO"]]
 
-        condition = gst_df["INVOICE NO"] == b_row["INVOICE NO"]
-        matched_gst = gst_df[condition]
+    for _, row in merged.iterrows():
+        status = ""
+        mismatch_cols = []
 
-        if matched_gst.empty:
+        if row["_merge"] == "left_only":
             status = "📄 Only in Books"
-            full_result.append({**b_row.to_dict(), "Status": status})
+        elif row["_merge"] == "right_only":
+            status = "📑 Only in GST"
         else:
-            gst_idx = matched_gst.index[0]
-            gst_matched_indices.add(gst_idx)
-            mismatch_cols = []
-
-            strict_cols = [
-                "GSTIN/UIN OF RECIPIENT",
-                "RECEIVER NAME",
-                "INVOICE DATE",
-                "IRN NUMBER",
-                "INVOICE TYPE",
-                "PLACE OF SUPPLY"
-            ]
-
             for col in strict_cols:
-                if col in books_df.columns and col in gst_df.columns:
-                    val_books = b_row[col]
-                    val_gst = gst_df.at[gst_idx, col]
-
-                    if col == "INVOICE TYPE":
-                        keywords = ["B2B", "REGULAR"]
-                        if any(kw in str(val_books).upper() for kw in keywords) and any(kw in str(val_gst).upper() for kw in keywords):
-                            continue
+                col_b, col_g = f"{col}_BOOKS", f"{col}_GST"
+                if col_b in row and col_g in row:
+                    val_b, val_g = str(row[col_b]), str(row[col_g])
 
                     if col == "PLACE OF SUPPLY":
-                        val_books = clean_state(val_books)
-                        val_gst = clean_state(val_gst)
+                        val_b, val_g = clean_state(val_b), clean_state(val_g)
 
-                    if col == "INVOICE DATE":
-                        val_books = str(val_books)
-                        val_gst = str(val_gst)
+                    if col == "INVOICE TYPE":
+                        keywords = ["B2B", "REGULAR", "EXPORT"]
+                        if any(kw in val_b for kw in keywords) and any(kw in val_g for kw in keywords):
+                            continue
 
-                    if val_books != val_gst:
+                    if val_b != val_g:
                         mismatch_cols.append(f"{col} Mismatch")
                         annexure.append({
-                            **{k: b_row[k] for k in key_cols},
+                            "INVOICE NO": row["INVOICE NO"],
+                            "INVOICE DATE": row.get("INVOICE DATE_BOOKS", row.get("INVOICE DATE_GST", "")),
                             "Column": col,
-                            "Books Value": val_books,
-                            "GST Value": val_gst,
-                            "Difference": "N/A"
+                            "Books Value": val_b,
+                            "GST Value": val_g,
+                            "Difference": ""
                         })
 
-            for col in amount_cols:
-                if col in books_agg.columns and col in gst_df.columns:
-                    try:
-                        b_val = books_agg.loc[books_agg["INVOICE NO"] == b_row["INVOICE NO"], col].values[0]
-                        diff = float(b_val) - float(gst_df.at[gst_idx, col])
-                        if abs(diff) > numeric_tolerance:
-                            mismatch_cols.append(f"{col} (Diff: {diff:.2f})")
-                            annexure.append({
-                                **{k: b_row[k] for k in key_cols},
-                                "Column": col,
-                                "Books Value": b_val,
-                                "GST Value": gst_df.at[gst_idx, col],
-                                "Difference": diff
-                            })
-                    except:
-                        pass
+            for col in numeric_cols:
+                col_b, col_g = f"{col}_BOOKS", f"{col}_GST"
+                if col_b in row and col_g in row:
+                    diff = float(row[col_b]) - float(row[col_g])
+                    if abs(diff) > numeric_tolerance:
+                        mismatch_cols.append(f"{col} (Diff: {diff:.2f})")
+                        annexure.append({
+                            "INVOICE NO": row["INVOICE NO"],
+                            "INVOICE DATE": row.get("INVOICE DATE_BOOKS", row.get("INVOICE DATE_GST", "")),
+                            "Column": col,
+                            "Books Value": row[col_b],
+                            "GST Value": row[col_g],
+                            "Difference": diff
+                        })
 
             status = "✅ Perfect Invoice Match" if not mismatch_cols else "⚠️ Mismatch"
-            full_result.append({**b_row.to_dict(), "Status": status})
 
-    for idx_g, g_row in gst_df.iterrows():
-        if idx_g not in gst_matched_indices:
-            full_result.append({**g_row.to_dict(), "Status": "📑 Only in GST"})
+        row_dict = {c: row[c] for c in row.index if not c.endswith("_merge")}
+        row_dict["Status"] = status
+        full_result.append(row_dict)
 
     return pd.DataFrame(full_result), pd.DataFrame(annexure)
 
+# ------------------------ Excel Output ------------------------
 def to_excel_bytes(full_reco, annexure, summary):
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -209,20 +191,35 @@ if books_file and gst_file:
         books.columns = books.columns.str.strip().str.upper()
         gst.columns = gst.columns.str.strip().str.upper()
 
-        # Map columns to standard
         col_mapping = {
             "INVOICE NUMBER": "INVOICE NO",
-            "INVOICE NO": "INVOICE NO",
             "GSTIN": "GSTIN/UIN OF RECIPIENT",
-            "GSTIN/UIN OF RECIPIENT": "GSTIN/UIN OF RECIPIENT",
-            "RECEIVER NAME": "RECEIVER NAME"
         }
         books.rename(columns=col_mapping, inplace=True)
         gst.rename(columns=col_mapping, inplace=True)
 
-        # ------------------------
-        # Input Data Summary
-        # ------------------------
+        # ------------------------ Default Aggregate by Invoice ------------------------
+        books_proc = preprocess(books)
+        gst_proc = preprocess(gst)
+
+        key_cols_agg = ["INVOICE NO", "GSTIN/UIN OF RECIPIENT", "RECEIVER NAME"]
+        numeric_cols = ["INVOICE VALUE", "TAXABLE VALUE", "INTEGRATED TAX", "CENTRAL TAX", "STATE/UT TAX"]
+        non_numeric_cols = ["INVOICE DATE", "PLACE OF SUPPLY", "INVOICE TYPE", "IRN NUMBER"]
+
+        for col in numeric_cols:
+            if col in books_proc.columns:
+                books_proc[col] = pd.to_numeric(books_proc[col].str.replace(",", ""), errors="coerce").fillna(0)
+            if col in gst_proc.columns:
+                gst_proc[col] = pd.to_numeric(gst_proc[col].str.replace(",", ""), errors="coerce").fillna(0)
+
+        books_proc = books_proc.groupby(key_cols_agg, as_index=False).agg(
+            {**{col: "sum" for col in numeric_cols}, **{col: "first" for col in non_numeric_cols}}
+        )
+        gst_proc = gst_proc.groupby(key_cols_agg, as_index=False).agg(
+            {**{col: "sum" for col in numeric_cols}, **{col: "first" for col in non_numeric_cols}}
+        )
+
+        # ------------------------ Input Data Summary ------------------------
         def display_invoice_summary(gst_df, books_df):
             st.subheader("📊 Input Data Summary")
             gst_invoices = gst_df["INVOICE NO"].nunique() if "INVOICE NO" in gst_df.columns else 0
@@ -230,6 +227,9 @@ if books_file and gst_file:
 
             gst_total = pd.to_numeric(gst_df["INVOICE VALUE"], errors="coerce").sum() if "INVOICE VALUE" in gst_df.columns else 0
             books_total = pd.to_numeric(books_df["INVOICE VALUE"], errors="coerce").sum() if "INVOICE VALUE" in books_df.columns else 0
+
+            gst_total = int(round(gst_total))
+            books_total = int(round(books_total))
 
             summary_df = pd.DataFrame({
                 "Metric": ["Number of Invoices", "Total Invoice Value"],
@@ -239,20 +239,27 @@ if books_file and gst_file:
 
             st.table(summary_df)
 
-        display_invoice_summary(gst, books)
+        display_invoice_summary(gst_proc, books_proc)
 
-        # Fixed key columns & amount columns
         key_cols = ["INVOICE NO", "GSTIN/UIN OF RECIPIENT", "RECEIVER NAME"]
         amount_cols = ["INVOICE VALUE", "TAXABLE VALUE", "INTEGRATED TAX", "CENTRAL TAX", "STATE/UT TAX"]
 
+        tolerance = st.number_input(
+            "Set Numeric Tolerance for Amount Comparison (₹)",
+            min_value=0.0,
+            max_value=10000000.0,
+            value=1.0,
+            step=0.5,
+            format="%.2f"
+        )
+
         if st.button("Run Reconciliation"):
             st.info("🔎 Performing GST Reconciliation at Invoice Level...")
-            full_reco, annexure = reconcile_rows(books, gst, key_cols, amount_cols, numeric_tolerance=1.0)
+            full_reco, annexure = reconcile_rows(books_proc, gst_proc, key_cols, amount_cols, numeric_tolerance=tolerance)
 
-            # Summary
             summary_counts = {
                 "✅ Perfect Invoice Match": (full_reco["Status"] == "✅ Perfect Invoice Match").sum(),
-                "⚠️ Mismatch": full_reco["Status"].str.startswith("⚠️").sum(),
+                "⚠️ Mismatch": (full_reco["Status"] == "⚠️ Mismatch").sum(),
                 "📄 Only in Books": (full_reco["Status"] == "📄 Only in Books").sum(),
                 "📑 Only in GST": (full_reco["Status"] == "📑 Only in GST").sum()
             }
@@ -264,6 +271,21 @@ if books_file and gst_file:
             st.subheader("📌 Reconciliation Summary")
             st.dataframe(summary_df, use_container_width=True)
 
+            # ------------------------ Chart Representation ------------------------
+            st.subheader("📈 Reconciliation Summary Chart")
+            chart_df = summary_df.copy()
+            chart_df.rename(columns={"Result": "Status", "Count": "Number of Invoices"}, inplace=True)
+            chart = alt.Chart(chart_df).mark_bar().encode(
+                x=alt.X('Status', sort=None),
+                y='Number of Invoices',
+                color='Status',
+                tooltip=['Status', 'Number of Invoices']
+            ).properties(
+                width=700,
+                height=400
+            )
+            st.altair_chart(chart, use_container_width=True)
+
             st.subheader("📋 Full Reconciliation")
             st.dataframe(full_reco, use_container_width=True)
 
@@ -271,7 +293,6 @@ if books_file and gst_file:
                 st.subheader("📑 Differences Annexure")
                 st.dataframe(annexure, use_container_width=True)
 
-            # Download buttons
             st.download_button(
                 "📥 Download Full Reconciliation (CSV)",
                 full_reco.to_csv(index=False).encode("utf-8"),
